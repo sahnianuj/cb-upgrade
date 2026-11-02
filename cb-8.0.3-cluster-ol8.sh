@@ -39,7 +39,7 @@ set -euo pipefail
 CB_VERSION="8.0.3"
 CLUSTER_NAME="securus-prod-8.0.3"
 ADMIN_USER="Administrator"
-ADMIN_PASS="<password>"
+ADMIN_PASS="password"
 
 # One line per node:  "<address>|<services>"
 #   address  - the DNS name (recommended) or private IP the other nodes use
@@ -51,11 +51,9 @@ ADMIN_PASS="<password>"
 #              data,index,query,fts,eventing,analytics,backup
 # The FIRST line is the bootstrap node and must include "data".
 NODES=(
-  "ip-172-31-3-?.us-west-1.compute.internal|data"
-  "ip-172-31-5-?.us-west-1.compute.internal|data"
-  "ip-172-31-1-?.us-west-1.compute.internal|data"
-  "ip-172-31-3-?.us-west-1.compute.internal|index,query"
-  "ip-172-31-7-?.us-west-1.compute.internal|index,query"
+  "ip-172-31-22-91.us-west-1.compute.internal|data"
+  "ip-172-31-23-78.us-west-1.compute.internal|data"
+  "ip-172-31-22-94.us-west-1.compute.internal|index,query"
 )
 
 # Memory quota per node, in MB, for each service. A quota only applies to
@@ -74,13 +72,18 @@ INDEX_STORAGE="default"          # default (Plasma) | memopt
 #             cluster.
 # The RAM values of all buckets added together must fit within DATA_RAM_MB.
 BUCKETS=(
-  "labdb|512|1|couchstore"
+  "threads|512|1|couchstore"
 )
 
 # One line per RBAC user:  "<username>|<password>|<roles>"
 # (If a role list contains commas, it is still a single field.)
+#   {BUCKETS} in a role expands to one role per bucket in BUCKETS, so
+#   bucket_full_access[{BUCKETS}] covers every bucket above - one or many -
+#   and follows renames. To limit a user to some buckets, name them:
+#   bucket_full_access[threads],bucket_full_access[orders]
+# Every bucket a role names must be in BUCKETS (checked before installing).
 USERS=(
-  "sync_gateway|sgpassword123|bucket_full_access[labdb]"
+  "sync_gateway|sgpassword123|bucket_full_access[{BUCKETS}]"
 )
 
 # Where each node keeps its data and its indexes. Couchbase best practice is
@@ -272,7 +275,7 @@ unpack_certs() {
   found=$(find "${work}" -maxdepth 3 -name ca.pem -not -path '*/__MACOSX/*' | head -n 1)
   if [ -z "${found}" ]; then
     rm -rf "${work}"
-    die "${archive} has no ca.pem inside. Create it from the certs folder, e.g. 'tar -czf certs.tar.gz certs'."
+    die "${archive} has no ca.pem inside. Re-create it with './cb-certs.sh generate' on your laptop, which writes certs.tar.gz."
   fi
   mv "$(dirname "${found}")" "${CERT_DIR}"
   rm -rf "${work}"
@@ -355,6 +358,38 @@ for entry in "${BUCKETS[@]}"; do
 done
 [ "${bucket_total}" -le "${DATA_RAM_MB}" ] || die "Bucket RAM adds up to ${bucket_total} MB, which is more than DATA_RAM_MB (${DATA_RAM_MB} MB)."
 
+BUCKET_NAMES=()
+for entry in "${BUCKETS[@]}"; do BUCKET_NAMES+=("${entry%%|*}"); done
+
+# expand_roles "<roles>" - replaces {BUCKETS} in each comma-separated role
+# with every bucket name, one role per bucket.
+expand_roles() {
+  local role b out=()
+  IFS=',' read -ra role_list <<< "$1"
+  for role in "${role_list[@]}"; do
+    if [[ ${role} == *"{BUCKETS}"* ]]; then
+      for b in "${BUCKET_NAMES[@]}"; do out+=("${role//"{BUCKETS}"/${b}}"); done
+    else
+      out+=("${role}")
+    fi
+  done
+  (IFS=,; echo "${out[*]}")
+}
+
+# A role on a bucket that isn't created here fails at the very end of the
+# run, so catch it now. "*" is Couchbase's all-buckets wildcard.
+for entry in "${USERS[@]}"; do
+  IFS='|' read -r user _ roles <<< "${entry}"
+  IFS=',' read -ra role_list <<< "$(expand_roles "${roles}")"
+  for role in "${role_list[@]}"; do
+    [[ ${role} =~ \[([^]:]+) ]] || continue
+    b="${BASH_REMATCH[1]}"
+    [ "${b}" = "*" ] && continue
+    [[ " ${BUCKET_NAMES[*]} " == *" ${b} "* ]] ||
+      die "USERS entry '${user}' has role ${role}, but bucket '${b}' is not in BUCKETS (${BUCKET_NAMES[*]}). Use {BUCKETS} or a bucket from BUCKETS."
+  done
+done
+
 # Every DNS name in NODES must resolve here, or joins fail later in less
 # obvious ways.
 unresolved=""
@@ -394,23 +429,101 @@ dnf update -y --exclude='curl*'
 dnf install -y wget python3 chrony lsof sysstat net-tools
 systemctl enable --now chronyd
 
-if [ ! -f /etc/systemd/system/disable_thp.service ]; then
-  cat > /etc/systemd/system/disable_thp.service << 'EOF'
+# Kernel settings follow the Couchbase docs ("Disabling Transparent Huge
+# Pages" and "Swap Space and Kernel Swappiness").
+
+# THP off, as a oneshot unit ordered before couchbase-server so it applies
+# before Couchbase starts at boot. The unit file is rewritten if it differs
+# (older runs of this script wrote a Type=simple unit with no ordering).
+THP_UNIT=/etc/systemd/system/disable_thp.service
+THP_UNIT_NEW=$(mktemp)
+cat > "${THP_UNIT_NEW}" << 'EOF'
 [Unit]
 Description=Disable Transparent Huge Pages (THP)
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=couchbase-server.service
 
 [Service]
-Type=simple
-ExecStart=/bin/sh -c "echo never > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag"
+Type=oneshot
+ExecStart=/bin/sh -c 'echo never | tee /sys/kernel/mm/transparent_hugepage/enabled > /dev/null'
+ExecStart=/bin/sh -c 'echo never | tee /sys/kernel/mm/transparent_hugepage/defrag > /dev/null'
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=basic.target
 EOF
+if cmp -s "${THP_UNIT_NEW}" "${THP_UNIT}"; then
+  rm -f "${THP_UNIT_NEW}"
+else
+  echo "Writing ${THP_UNIT}."
+  mv "${THP_UNIT_NEW}" "${THP_UNIT}"
+  chmod 644 "${THP_UNIT}"
   systemctl daemon-reload
+  # reenable moves the enable symlink from multi-user.target to basic.target.
+  systemctl reenable disable_thp
 fi
-systemctl enable --now disable_thp
-grep -q '^vm.swappiness=0' /etc/sysctl.conf || echo 'vm.swappiness=0' >> /etc/sysctl.conf
-sysctl -p
+systemctl enable disable_thp
+systemctl start disable_thp
+
+# Swappiness 1, not 0: since kernel 3.5, 0 raises the risk of the OOM killer
+# under memory and I/O pressure. A drop-in file is replaced on every run, so
+# changing the value here takes effect on re-run. The vm.swappiness=0 line
+# that older runs appended to /etc/sysctl.conf is removed, because that file
+# is read after /etc/sysctl.d and would override it.
+sed -i '/^vm\.swappiness=0$/d' /etc/sysctl.conf
+grep -Eq '^[[:space:]]*vm\.swappiness' /etc/sysctl.conf &&
+  warn "/etc/sysctl.conf also sets vm.swappiness and overrides /etc/sysctl.d/99-couchbase.conf. Remove it from /etc/sysctl.conf."
+{
+  echo "# Written by cb-8.0.3-cluster-ol8.sh - Couchbase kernel settings."
+  echo "vm.swappiness = 1"
+  # Red Hat kernels only (RHEL 8 / Oracle Linux 8 RHCK): makes the setting
+  # apply inside cgroups too. Absent on other kernels, so only set if present.
+  if [ -e /proc/sys/vm/force_cgroup_v2_swappiness ]; then
+    echo "vm.force_cgroup_v2_swappiness = 1"
+  fi
+} > /etc/sysctl.d/99-couchbase.conf
+sysctl --system > /dev/null || warn "sysctl --system reported errors in a sysctl file; the values in effect are checked below."
+
+# tuned profiles can set THP and swappiness themselves (virtual-guest sets
+# swappiness to 30), overriding the above. If tuned is running, layer a
+# couchbase profile on top of the active one.
+if systemctl is-active --quiet tuned; then
+  TUNED_ACTIVE=$(tuned-adm active 2>/dev/null | sed -n 's/^Current active profile: //p')
+  TUNED_BASE="${TUNED_ACTIVE}"
+  if [ "${TUNED_ACTIVE}" = "couchbase" ]; then
+    TUNED_BASE=$(sed -n 's/^include=//p' /etc/tuned/couchbase/tuned.conf 2>/dev/null)
+  fi
+  [ -n "${TUNED_BASE}" ] || TUNED_BASE=$(tuned-adm recommend 2>/dev/null)
+  echo "tuned is active (profile: ${TUNED_ACTIVE:-none}) - applying the 'couchbase' profile on top of ${TUNED_BASE:-nothing}."
+  mkdir -p /etc/tuned/couchbase
+  cat > /etc/tuned/couchbase/tuned.conf << EOF
+# Written by cb-8.0.3-cluster-ol8.sh - Couchbase kernel settings.
+[main]
+${TUNED_BASE:+include=${TUNED_BASE// /,}}
+
+[vm]
+transparent_hugepages=never
+
+[sysctl]
+vm.swappiness=1
+EOF
+  tuned-adm profile couchbase
+else
+  echo "tuned not active - nothing to override."
+fi
+
+# Show what is actually in effect, and flag anything that didn't stick.
+SWAPPINESS=$(cat /proc/sys/vm/swappiness)
+THP_ENABLED=$(cat /sys/kernel/mm/transparent_hugepage/enabled)
+THP_DEFRAG=$(cat /sys/kernel/mm/transparent_hugepage/defrag)
+echo "vm.swappiness: ${SWAPPINESS}"
+[ -e /proc/sys/vm/force_cgroup_v2_swappiness ] &&
+  echo "vm.force_cgroup_v2_swappiness: $(cat /proc/sys/vm/force_cgroup_v2_swappiness) (takes full effect after a reboot)"
+echo "THP enabled: ${THP_ENABLED}"
+echo "THP defrag:  ${THP_DEFRAG}"
+[ "${SWAPPINESS}" = "1" ] || warn "vm.swappiness is ${SWAPPINESS}, not 1. Something else on this machine sets it."
+[[ ${THP_ENABLED} == *"[never]"* && ${THP_DEFRAG} == *"[never]"* ]] ||
+  warn "Transparent Huge Pages are not fully disabled. Check tuned and any other THP setting on this machine."
 
 if systemctl is-active --quiet firewalld; then
   echo "firewalld is active - opening Couchbase node-to-node and client ports."
@@ -420,7 +533,7 @@ if systemctl is-active --quiet firewalld; then
   done
   firewall-cmd --reload
 else
-  echo "firewalld not active - relying on the EC2 security group."
+  echo "firewalld not active - relying on the network firewall / security group."
 fi
 
 echo "=== [3/7] Installing Couchbase Server ${CB_VERSION} ==="
@@ -500,7 +613,7 @@ if [ "${ROLE}" = "joiner" ]; then
   for p in 8091 18091 21100; do
     timeout 3 bash -c "</dev/tcp/${BOOTSTRAP}/${p}" 2>/dev/null || blocked+=" ${p}"
   done
-  [ -z "${blocked}" ] || die "Cannot reach bootstrap node ${BOOTSTRAP} on port(s)${blocked}. Nodes need all TCP open between them: add an inbound rule 'All TCP' from the nodes' own security group, check firewalld on both nodes, then re-run."
+  [ -z "${blocked}" ] || die "Cannot reach bootstrap node ${BOOTSTRAP} on port(s)${blocked}. Nodes need all TCP open between them: check firewalld on both nodes and any network firewall or security group between them, then re-run."
   install_certs
   retry join_cluster
   echo "=== [7/7] Rebalancing this node in ==="
@@ -544,6 +657,7 @@ done
 
 for entry in "${USERS[@]}"; do
   IFS='|' read -r user pass roles <<< "${entry}"
+  roles=$(expand_roles "${roles}")
   echo "Setting RBAC user ${user} (${roles})."
   "${CLI}" user-manage -c localhost:8091 "${AUTH[@]}" \
     --set --rbac-username "${user}" --rbac-password "${pass}" \
@@ -553,23 +667,28 @@ done
 # ------------------------------------------------------------------ summary --
 
 if [ -n "${OLD_CLUSTER_HOST}" ]; then
-  FIRST_BUCKET="$(echo "${BUCKETS[0]}" | cut -d'|' -f1)"
   echo ""
-  echo "XDCR is created on the SOURCE side. Run these on the old 7.0.3 cluster:"
+  echo "XDCR is created on the SOURCE side. Run these on the old 7.0.3 cluster"
+  echo "(xdcr-setup once, then xdcr-replicate once per bucket):"
   echo "  couchbase-cli xdcr-setup -c ${OLD_CLUSTER_HOST}:8091 -u ${ADMIN_USER} -p ${ADMIN_PASS} \\"
   echo "    --create --xdcr-cluster-name new-8.0-cluster --xdcr-hostname ${BOOTSTRAP} \\"
   echo "    --xdcr-username ${ADMIN_USER} --xdcr-password ${ADMIN_PASS} --xdcr-secure-connection none"
-  echo "  couchbase-cli xdcr-replicate -c ${OLD_CLUSTER_HOST}:8091 -u ${ADMIN_USER} -p ${ADMIN_PASS} \\"
-  echo "    --create --xdcr-cluster-name new-8.0-cluster \\"
-  echo "    --xdcr-from-bucket ${FIRST_BUCKET} --xdcr-to-bucket ${FIRST_BUCKET} --xdcr-replication-mode xmem"
+  for b in "${BUCKET_NAMES[@]}"; do
+    echo "  couchbase-cli xdcr-replicate -c ${OLD_CLUSTER_HOST}:8091 -u ${ADMIN_USER} -p ${ADMIN_PASS} \\"
+    echo "    --create --xdcr-cluster-name new-8.0-cluster \\"
+    echo "    --xdcr-from-bucket ${b} --xdcr-to-bucket ${b} --xdcr-replication-mode xmem"
+  done
 fi
 
-SUMMARY_HOME=$(getent passwd ec2-user > /dev/null && echo /home/ec2-user || echo /root)
+# Summary goes to the home of whoever ran sudo; ec2-user or root otherwise.
+SUMMARY_USER="${SUDO_USER:-}"
+[ -n "${SUMMARY_USER}" ] || { getent passwd ec2-user > /dev/null && SUMMARY_USER=ec2-user || SUMMARY_USER=root; }
+SUMMARY_HOME=$(getent passwd "${SUMMARY_USER}" | cut -d: -f6)
 {
   echo "Couchbase Server ${CB_VERSION} cluster '${CLUSTER_NAME}' is provisioned."
   echo ""
   echo "Web Console:  via SSH tunnel from your laptop, then http://localhost:8091   (${ADMIN_USER} / ${ADMIN_PASS})"
-  echo "              ssh -i <key.pem> -L 8091:localhost:8091 ec2-user@<any-node-public-ip>"
+  echo "              ssh -L 8091:localhost:8091 <user>@<any-node>"
   echo "Nodes:";   printf '  %s\n' "${NODES[@]}"
   echo "Buckets:"; printf '  %s\n' "${BUCKETS[@]}"
   echo "Users:";   for u in "${USERS[@]}"; do echo "  $(echo "${u}" | cut -d'|' -f1)"; done
@@ -581,7 +700,7 @@ SUMMARY_HOME=$(getent passwd ec2-user > /dev/null && echo /home/ec2-user || echo
   echo ""
   echo "Safe to re-run. Full log: /var/log/cb-${CB_VERSION}-cluster-install.log"
 } > "${SUMMARY_HOME}/CB_${CB_VERSION}_CLUSTER_READY.txt"
-chown "$(stat -c %U "${SUMMARY_HOME}")" "${SUMMARY_HOME}/CB_${CB_VERSION}_CLUSTER_READY.txt"
+chown "${SUMMARY_USER}" "${SUMMARY_HOME}/CB_${CB_VERSION}_CLUSTER_READY.txt"
 
 echo "############# Run finished: $(date -u '+%Y-%m-%dT%H:%M:%SZ') #############"
 echo "=== Done. See ${SUMMARY_HOME}/CB_${CB_VERSION}_CLUSTER_READY.txt ==="

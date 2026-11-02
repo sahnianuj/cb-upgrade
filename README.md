@@ -8,6 +8,7 @@ Every install script targets **Oracle Linux 8** on EC2 unless noted. Every one i
 
 | File | Runs on | Purpose |
 |---|---|---|
+| [`getting-started-guide.md`](getting-started-guide.md) | Your laptop | **Start here.** Step-by-step walkthrough of these scripts in run order: multi-node Couchbase 8.0.3 cluster (with `cb-certs.sh`), multi-node Sync Gateway 4.1, then `migrate-indexes.sh`. |
 | [`user-data-ol8.sh`](user-data-ol8.sh) | One OL8 lab server | **Old environment (lab).** Couchbase Server 7.0.3 and Sync Gateway 2.1 on one box, with sample data and users. |
 | [`EC2_Lab_Setup.md`](EC2_Lab_Setup.md) | Your laptop | Step-by-step AWS CLI guide to launch the lab server (security group, AMI, user-data). **Out of date:** written for Amazon Linux 2. For OL8, use an Oracle-published OL8 AMI (owner `131827586825`) and pass `user-data-ol8.sh` as user-data. The security group and verification steps are unchanged. |
 | [`sync_gateway_4984_tests.md`](sync_gateway_4984_tests.md) | Anywhere that reaches SGW | Manual `curl` tests of the Sync Gateway public API, including channel access control. |
@@ -77,8 +78,8 @@ ANALYTICS_RAM_MB=1024
 BUCKETS=(                        # name | RAM MB per data node | replicas | couchstore|magma
   "labdb|1024|1|couchstore"
 )
-USERS=(                          # username | password | roles
-  "sync_gateway|sgpassword123|bucket_full_access[labdb]"
+USERS=(                          # username | password | roles   ({BUCKETS} = every bucket above)
+  "sync_gateway|sgpassword123|bucket_full_access[{BUCKETS}]"
 )
 ```
 
@@ -341,7 +342,10 @@ ca/ca.key, ca/ca.pem            ← the CA. Keep it on your laptop. Never copy c
 certs/ca.pem                    ← the CA certificate, for nodes and clients
 certs/<node-ip>/chain.pem       ← one certificate + key per node
 certs/<node-ip>/pkey.key
+certs.tar.gz                    ← certs/ packed into one file, ready to copy to the nodes
 ```
+
+`certs.tar.gz` is rebuilt on every run, so it always matches `certs/`. The output lists the node certificates in it. `generate` also warns about any folder under `certs/` that no longer matches a `NODES` entry.
 
 It's safe to re-run. Existing valid certificates are kept. Only missing ones, ones expiring within 30 days, or ones not matching the CA or address are issued. Node certificates last **10 years** and the CA **20 years**, so every node certificate expires before the CA that signed it. Two things to know:
 - **Existing certificates keep their old lifetime.** A re-run of `generate` doesn't re-issue a certificate just because the lifetime setting changed. To re-issue them, delete the node folders under `certs/` (not `ca/`) and run `generate` again.
@@ -360,7 +364,7 @@ for h in <node1> <node2> <node3> <node4> <node5>; do
 done
 ```
 
-**Or copy one archive instead of the folder.** Create `certs.tar.gz` (`tar -czf certs.tar.gz certs`) or `certs.zip`, and copy it next to the cluster script. If `certs/` is missing, the script unpacks it, using `tar` or `unzip` (installing `unzip` if needed). It also accepts `cert.tar.gz`, `cert.tgz` or `cert.zip`, and archives with the files at the top level instead of inside a `certs/` folder. An existing `certs/` folder is never overwritten.
+**Or copy one archive instead of the folder.** Copy the `certs.tar.gz` that `generate` created (or your own `certs.zip`) next to the cluster script. If `certs/` is missing, the script unpacks it, using `tar` or `unzip` (installing `unzip` if needed). It also accepts `cert.tar.gz`, `cert.tgz` or `cert.zip`, and archives with the files at the top level instead of inside a `certs/` folder. An existing `certs/` folder is never overwritten.
 
 Keep the files on the nodes after installing. With `CUSTOM_CERTS="true"`, every re-run checks them to confirm the node is serving the right certificate.
 
@@ -395,7 +399,7 @@ Do this once the new Couchbase cluster is up. Sync Gateway runs on its **own** O
 
 | Check | How |
 |---|---|
-| The cluster has the bucket and the Sync Gateway RBAC user | The cluster script creates both from `BUCKETS` and `USERS`: `labdb`, and `sync_gateway` / `sgpassword123` with `bucket_full_access[labdb]`. Check under **Security** and **Buckets** in the console. |
+| The cluster has the bucket and the Sync Gateway RBAC user | The cluster script creates both from `BUCKETS` and `USERS`: every bucket in `BUCKETS`, and `sync_gateway` / `sgpassword123` with `bucket_full_access` on each of them (`bucket_full_access[{BUCKETS}]`). Check under **Security** and **Buckets** in the console. |
 | An OL8 instance for Sync Gateway, in the **same VPC** | For example `t3.medium`. It must resolve the nodes' private DNS names, which it can if it's in the same VPC. |
 | Network rules | On the **Couchbase** security group: allow 8091, 8093 and 11210 from the Sync Gateway server's group. On the **Sync Gateway** group: 4984 for apps, and 22 from your IP. See [Network: inbound rules](#2-network-inbound-rules). |
 | The old Sync Gateway 2.1 config | In the lab it's `/opt/sync_gateway/etc/sync_gateway.json` on the old server. Copy it off, for example: `scp -i <key.pem> ec2-user@<old-sgw>:/opt/sync_gateway/etc/sync_gateway.json ./old-sync_gateway.json`. It's root-owned, so `sudo cp` it to your home folder first if `scp` is refused. |

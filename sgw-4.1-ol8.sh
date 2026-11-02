@@ -251,15 +251,22 @@ for name, conf in users.items():
 done
 
 echo "=== [8/8] Summary ==="
-TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
-PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo "<unavailable>")
+# EC2 public IP if there is one; on any other VM, this machine's first IP.
+TOKEN=$(curl -s --connect-timeout 2 --max-time 3 -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true)
+PUBLIC_IP=""
+[ -n "${TOKEN}" ] && PUBLIC_IP=$(curl -sf --connect-timeout 2 --max-time 3 -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
+[ -n "${PUBLIC_IP}" ] || PUBLIC_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# Summary goes to the home of whoever ran sudo; ec2-user or root otherwise.
+SUMMARY_USER="${SUDO_USER:-}"
+[ -n "${SUMMARY_USER}" ] || { getent passwd ec2-user > /dev/null && SUMMARY_USER=ec2-user || SUMMARY_USER=root; }
+SUMMARY_FILE="$(getent passwd "${SUMMARY_USER}" | cut -d: -f6)/SGW_4.1_READY.txt"
 
 {
   echo "Sync Gateway ${SGW_VERSION} is provisioned on this machine (Oracle Linux 8),"
   echo "pointed at Couchbase Server at ${CB_HOST}, configured from ${MIGRATED_DIR}."
   echo ""
   echo "Public API:  http://${PUBLIC_IP}:4984"
-  echo "Admin API:   http://${PUBLIC_IP}:4985"
+  echo "Admin API:   http://localhost:4985   (bound to the interface in bootstrap.json; loopback by default)"
   echo "Config path actually used: ${SGW_CONFIG_PATH}"
   echo "Databases:"
   for db_config_file in "${DB_CONFIG_FILES[@]}"; do
@@ -269,8 +276,8 @@ PUBLIC_IP=$(curl -s -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.2
   done
   echo ""
   echo "This script is safe to re-run - see /var/log/sgw-4.1-install.log for full history."
-} > /home/ec2-user/SGW_4.1_READY.txt
-chown ec2-user:ec2-user /home/ec2-user/SGW_4.1_READY.txt
+} > "${SUMMARY_FILE}"
+chown "${SUMMARY_USER}" "${SUMMARY_FILE}"
 
 echo "############# Run finished: $(date -u '+%Y-%m-%dT%H:%M:%SZ') #############"
-echo "=== Done. See /home/ec2-user/SGW_4.1_READY.txt for details. ==="
+echo "=== Done. See ${SUMMARY_FILE} for details. ==="

@@ -13,6 +13,8 @@
 #                       Addresses default to NODES in cb-8.0.3-cluster-ol8.sh.
 #                       Re-run any time (e.g. after adding a node): only
 #                       missing, expiring or invalid certificates are issued.
+#                       Every run also rebuilds ./certs.tar.gz, the one file
+#                       to copy to the nodes.
 #
 #   install <addr>      Run ON a node, as root. Called by the cluster script
 #                       when CUSTOM_CERTS="true". Trusts certs/ca.pem and
@@ -160,9 +162,28 @@ cmd_generate() {
     fi
   done
 
+  # Folders left over from nodes no longer listed are harmless but confusing.
+  local dir
+  for dir in "${CERT_DIR}"/*/; do
+    [ -d "${dir}" ] || continue
+    dir=$(basename "${dir}")
+    [[ " ${addrs//$'\n'/ } " == *" ${dir} "* ]] ||
+      warn "${CERT_DIR}/${dir} is not in the node list. Delete it if that node is gone, then re-run generate."
+  done
+
+  # One archive to copy to the nodes, rebuilt on every run so it always
+  # matches CERT_DIR. The cluster script unpacks <CERT_DIR>.tar.gz itself
+  # when CERT_DIR is missing on the node. COPYFILE_DISABLE stops macOS tar
+  # adding ._* metadata files.
+  local archive="${CERT_DIR}.tar.gz"
+  (umask 077 && COPYFILE_DISABLE=1 tar -C "$(dirname "${CERT_DIR}")" -czf "${archive}" "$(basename "${CERT_DIR}")")
+
   echo ""
-  echo "Done. Copy ${CERT_DIR} next to the cluster script on every node, for example:"
-  echo "  scp -r ${CERT_DIR} ec2-user@<node>:~/"
+  echo "Done. Created ${archive} with these node certificates:"
+  tar -tzf "${archive}" | grep '/chain.pem$' | sed 's|^|  |'
+  echo "Copy it, with cb-certs.sh, next to the cluster script on every node, for example:"
+  echo "  scp $(basename "${archive}") cb-certs.sh cb-8.0.3-cluster-ol8.sh <user>@<node>:~/"
+  echo "A node that already has a ${CERT_DIR##*/}/ folder keeps it: delete that folder on the node first to pick up new certificates."
   echo "Keep ${CA_DIR} private - it holds the CA key. Do not copy it to the nodes."
 }
 
